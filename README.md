@@ -15,7 +15,7 @@ Genome-Wide Association Studies (GWAS) analyze the influence of individual genet
 
 ## Usage example
 
-Running the Transformer on a single GPU with a synthetic example dataset(fourth order interaction) with 1000 SNPs, 1600 samples (800 controls, 800 cases), splitting the dataset in 6 partitions, combining them in pairs, and selecting the top 5% SNPs:
+Running the Transformer on a single GPU with a synthetic example dataset (fourth order interaction) with 1000 SNPs, 1600 samples (800 controls, 800 cases), splitting the dataset in 6 partitions, combining them in pairs, and selecting the top 5% SNPs:
 
 ```bash
 $ python3 ED_Transformer.py -path Add4.txt -partitions 6 -comb 2 -top 0.05 -device GPU -n 1  
