@@ -30,7 +30,7 @@ $ -comb COMB             the combination order to merge partitions
 $ -top TOP               best SNP percentage to report after training (between 0 and 1)
 $ -device DEVICE         the device to use (e.g., CPU, GPU, TPU)
 $ -n N                   number of devices
-$ -sparsity SPARSITY     an optional float (between 0 and 1) for the sparsity percentage on the transformer's attention modules. Defaults to 0.9.
+$ -sparsity SPARSITY     an optional float (between 0 and 1) for the sparsity percentage on the transformer attention modules. Defaults to 0.9.
 $ -epochs EPOCHS         an optional int for the epochs to train the transformer. Defaults to 15.  
 ```
 
