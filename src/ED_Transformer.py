@@ -98,11 +98,15 @@ class TransformerBlock(tf.keras.layers.Layer):
     def __init__(self, embed_dim, num_heads, batch, input_size, sparsity, n_devices):
         super(TransformerBlock, self).__init__()
         self.att = Attention(embed_dim, num_heads, 'tanh', sparsity, n_devices)
-        self.w = tf.Variable(initial_value = tf.zeros_initializer()(shape=(int(batch/n_devices), 
-                            1,input_size-1)), trainable = False, dtype=tf.float32)
-
+        # 기존의 tf.Variable 대신 self.add_weight를 사용합니다.
+        self.w = self.add_weight(
+            name="attention_scores",
+            shape=(int(batch/n_devices), 1, input_size-1),
+            initializer="zeros",
+            trainable=False
+        )
         self.ffn = tf.keras.Sequential(
-            [tf.keras.layers.Dense(embed_dim, activation = 'tanh'),]
+            [tf.keras.layers.Dense(embed_dim, activation='tanh'),]
         )
        
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -111,8 +115,9 @@ class TransformerBlock(tf.keras.layers.Layer):
         self.dropout2 = tf.keras.layers.Dropout(0.01)
         
     def call(self, inputs, query, key, training=True):
-        attn_output, attn_scores = self.att(query = query, key = key, value = inputs)
-        self.w.assign_add(tf.cast(attn_scores, dtype = tf.float32))
+        attn_output, attn_scores = self.att(query=query, key=key, value=inputs)
+        # self.w는 이제 non_trainable_weights에 포함되어 있으므로 assign_add 가능
+        self.w.assign_add(tf.cast(attn_scores, dtype=tf.float32))
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(inputs[:,0:inputs.shape[1]-1,:] + attn_output)
         ffn_output = self.ffn(out1)
@@ -120,48 +125,78 @@ class TransformerBlock(tf.keras.layers.Layer):
         return self.layernorm2(ffn_output + out1), attn_scores
 
 #Function to build transformer neural network
-def build_model(input_size, batch, splits, comb_order, sparsity, n_devices):
+import tensorflow as tf
+from itertools import combinations
+from tensorflow.keras.layers import Input, Dense, Concatenate, Dropout, GlobalAveragePooling1D, Reshape
 
+def build_model(input_size, batch, splits, comb_order, sparsity, n_devices):
     num_heads = 1
     vocab = 3
     embed_dim = 32
 
-    inputs = tf.keras.layers.Input(shape=(input_size,), batch_size=int(batch))
-    outputs = []
-    comb = list(combinations([i for i in range(splits)],comb_order))
-
+    # Input layer (batch size를 명시적으로 지정)
+    inputs = Input(shape=(input_size,), batch_size=int(batch))
+    
     maxlen = input_size - 1
-    embedding_layer = TokenAndPositionEmbedding(maxlen+1, vocab, int(embed_dim))
+    # Token and Position Embedding layer (사용자 정의 클래스여야 함)
+    embedding_layer = TokenAndPositionEmbedding(maxlen + 1, vocab, int(embed_dim))
     y = embedding_layer(inputs)
     
-    kv_shape = (y.shape[0], y.shape[1]-1, y.shape[2], num_heads)
-    q_shape = (y.shape[0], 1, y.shape[2], num_heads)
-    q_layer = tf.keras.layers.Dense(q_shape[2]*num_heads, activation = 'tanh', kernel_initializer = tf.keras.initializers.Identity(gain=1.0), kernel_constraint = Top_KAST(S = sparsity))
-    k_layer = tf.keras.layers.Dense(kv_shape[2]*num_heads, activation = 'tanh', kernel_initializer = tf.keras.initializers.Identity(gain=1.0), kernel_constraint = Top_KAST(S = sparsity))
-    query = tf.reshape(q_layer(y[:,y.shape[1]-1:,:]), q_shape)
-    key = tf.reshape(k_layer(y[:,0:y.shape[1]-1,:]), kv_shape)
+    # 정적 shape 정보를 사용하여 y의 크기를 구함
+    # y.shape는 TensorShape 객체를 반환하며, 배치와 시퀀스 길이, 피처 차원이 포함됨
+    y_shape = y.shape  # 예: (batch, input_size, embed_dim)
+    batch_size = y_shape[0]       # 이미 지정한 batch 크기 (정수)
+    seq_len = y_shape[1]          # input_size (정적)
+    feat_dim = y_shape[2]         # embed_dim (정적)
+    
+    # 키와 쿼리의 목적에 맞게 shape 설정
+    kv_shape = (batch_size, seq_len - 1, feat_dim, num_heads)
+    q_shape = (batch_size, 1, feat_dim, num_heads)
 
-    for i in range(len(comb)):
-        indexes = [comb[i][j] for j in range(comb_order)]
-        sizes = [int((indexes[j]+1)*maxlen/splits) - int(indexes[j]*maxlen/splits) for j in range(comb_order)]
-        key_list = [key[:,int(indexes[j]*maxlen/splits):int((indexes[j]+1)*maxlen/splits),:,:] for j in range(comb_order)]
-        y_list = [y[:,int(indexes[j]*maxlen/splits):int((indexes[j]+1)*maxlen/splits),:] for j in range(comb_order)]
-
-        key_list.append(key[:,maxlen:maxlen+1,:,:])
-        y_list.append(y[:,maxlen:maxlen+1,:])
-
-        k2 = tf.keras.layers.Concatenate(axis = 1)(key_list)
-        y2 = tf.keras.layers.Concatenate(axis = 1)(y_list)
-
+    # Dense layers (Keras 레이어를 사용하여 생성)
+    q_layer = Dense(q_shape[2] * num_heads, activation='tanh',
+                    kernel_initializer=tf.keras.initializers.Identity(gain=1.0),
+                    kernel_constraint=Top_KAST(S=sparsity))
+    k_layer = Dense(kv_shape[2] * num_heads, activation='tanh',
+                    kernel_initializer=tf.keras.initializers.Identity(gain=1.0),
+                    kernel_constraint=Top_KAST(S=sparsity))
+    
+    # Keras의 Reshape 레이어를 사용하여 KerasTensor의 재구성을 진행 (tf.reshape 대신)
+    query = Reshape(q_shape[1:])(q_layer(y[:, -1:, :]))
+    key = Reshape(kv_shape[1:])(k_layer(y[:, :-1, :]))
+    
+    outputs = []
+    comb = list(combinations(range(splits), comb_order))
+    
+    for indexes in comb:
+        # 각 구간의 크기를 계산
+        sizes = [int((idx + 1) * maxlen / splits) - int(idx * maxlen / splits) for idx in indexes]
+        
+        # 지정된 인덱스 범위에 따라 key와 y를 슬라이싱
+        key_list = [key[:, int(idx * maxlen / splits):int((idx + 1) * maxlen / splits), :, :] for idx in indexes]
+        y_list   = [y[:, int(idx * maxlen / splits):int((idx + 1) * maxlen / splits), :] for idx in indexes]
+        
+        # 마지막 시퀀스 위치 추가
+        key_list.append(key[:, maxlen:maxlen + 1, :, :])
+        y_list.append(y[:, maxlen:maxlen + 1, :])
+        
+        # Concatenate 레이어로 리스트 결합
+        k2 = Concatenate(axis=1)(key_list)
+        y2 = Concatenate(axis=1)(y_list)
+        
+        # TransformerBlock은 사용자 정의 레이어/함수여야 함
         transformer_block = TransformerBlock(embed_dim, num_heads, batch, sum(sizes) + 1, sparsity, n_devices)
-        z, scores = transformer_block(y2,query,k2)
-        z = tf.keras.layers.GlobalAveragePooling1D(data_format = 'channels_first')(z)
-        z = tf.keras.layers.Dropout(0.01)(z)
-        z = tf.keras.layers.Dense(embed_dim, activation = 'tanh')(z) 
-        z = tf.keras.layers.Dropout(0.01)(z)
-        z = tf.keras.layers.Dense(1, activation = "sigmoid")(z)
+        z, scores = transformer_block(y2, query, k2)
+        
+        # 후처리: GlobalAveragePooling, Dropout, Dense 레이어
+        z = GlobalAveragePooling1D(data_format='channels_first')(z)
+        z = Dropout(0.01)(z)
+        z = Dense(embed_dim, activation='tanh')(z)
+        z = Dropout(0.01)(z)
+        z = Dense(1, activation="sigmoid")(z)
+        
         outputs.append(z)
-
+    
     model = tf.keras.Model(inputs, outputs)
     return model
 
@@ -276,7 +311,7 @@ def training_model(path, splits, comb_order, top, strategy, n_devices, sparsity,
         if(zipfile.is_zipfile(path)):
             f_op = zip_epi.open(f)
         else:
-            f_op = open(f, "r")
+            f_op = open("../testdata/" + f, "r")
         
         #Opening Dataset
         dataset, label = get_dataset(f_op)
@@ -287,20 +322,28 @@ def training_model(path, splits, comb_order, top, strategy, n_devices, sparsity,
         pos = se_numpy(dataset.T, 5, 32)
 
         if(strategy is None):
-            comb = list(combinations([i for i in range(splits)],comb_order))
+            comb = list(combinations(range(splits), comb_order))
             if(snpsize != snpflag):
                 snpflag = snpsize
                 model = build_model(dataset.shape[1], batch, splits, comb_order, sparsity, 1)
-                optim = tf.keras.optimizers.Adam(learning_rate = 0.001)
-                model.compile(optimizer = optim, loss = ['binary_crossentropy']*len(comb), metrics = [tf.keras.metrics.Precision(),tf.keras.metrics.Recall(),'accuracy'])
+                optim = tf.keras.optimizers.Adam(learning_rate=0.001)
+                num_outputs = len(comb)
+                metrics_list = [[tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), 'accuracy'] for _ in range(num_outputs)]
+                model.compile(optimizer=optim, 
+                            loss=['binary_crossentropy'] * num_outputs, 
+                            metrics=metrics_list)
         else:
-            comb = list(combinations([i for i in range(splits)],comb_order))
+            comb = list(combinations(range(splits), comb_order))
             with strategy.scope():
                 if(snpsize != snpflag):
                     snpflag = snpsize
                     model = build_model(dataset.shape[1], batch, splits, comb_order, sparsity, n_devices)
-                    optim = tf.keras.optimizers.Adam(learning_rate = 0.001)
-                    model.compile(optimizer = optim, loss = ['binary_crossentropy']*len(comb), metrics = [tf.keras.metrics.Precision(),tf.keras.metrics.Recall(),'accuracy'])
+                    optim = tf.keras.optimizers.Adam(learning_rate=0.001)
+                    num_outputs = len(comb)
+                    metrics_list = [[tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), 'accuracy'] for _ in range(num_outputs)]
+                    model.compile(optimizer=optim, 
+                                loss=['binary_crossentropy'] * num_outputs, 
+                                metrics=metrics_list)
 
         #Training the transformer
         x_train, y_train = dataset[0:samples,:], label[0:samples]
@@ -330,11 +373,17 @@ def training_model(path, splits, comb_order, top, strategy, n_devices, sparsity,
         x_test = tf.Variable(x_train[0:int(batch/n_devices),:])
 
         with tf.GradientTape() as tape:
-            tape.reset()
             tape.watch(x_test)
-            prediction, layer_output = temp_model(x_test)
-            loss = loss_object([label[0:int(batch/n_devices)]]*(len(comb)), tf.squeeze(prediction))
-        
+            predictions, layer_output = temp_model(x_test)  # predictions는 리스트로 반환됨
+            losses = []
+            # 각 출력(prediction)에 대해 loss를 개별 계산
+            for pred in predictions:
+                # pred의 마지막 차원이 1이면 squeeze하여 (batch, ) 형태로 변환합니다.
+                loss_val = loss_object(label[0:int(batch/n_devices)], tf.squeeze(pred, axis=-1))
+                losses.append(loss_val)
+            # 모든 출력에 대한 loss의 평균을 최종 loss로 사용
+            loss = tf.reduce_mean(losses)
+
         gradient = tape.gradient(loss, layer_output)
         gradients = np.zeros(snpsize)
 
